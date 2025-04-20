@@ -81,7 +81,7 @@ To run this project locally, you will need a web server (like Apache, Nginx, or 
 
 ## License
 
-(You can add a license here, e.g., MIT, Apache 2.0, etc.)
+MIT
 
 ## Acknowledgements
 
