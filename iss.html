@@ -1,0 +1,882 @@
+
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>ISS & Starlink Tracker</title>
+        <style>
+            body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+            #heading { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); text-align: center; z-index: 10; }
+            #heading h1 { margin: 0; font-size: 1.5em; }
+            .border { height: 2px; background: linear-gradient(to right, transparent, white, transparent); margin-top: 5px; }
+            .lil-gui { z-index: 100 !important; }
+             #ui-container {
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                color: white;
+                font-family: Arial, sans-serif;
+                padding: 10px;
+                background: rgba(0, 0, 0, 0.6);
+                border-radius: 5px;
+                z-index: 10;
+                pointer-events: none; /* Make sure UI doesn't block interactions */
+             }
+             #progress-container { margin-top: 10px; }
+             #starlink-status { margin-top: 5px; font-size: 0.9em; } /* Style for Starlink status */
+        </style>
+    </head>
+    <body>
+        <div id="heading">
+            <h1>ISS & Starlink Tracker</h1>
+            <div class="border"></div>
+        </div>
+
+        <!-- UI Container will be populated by JS -->
+        <div id="ui-container">
+            <div id="iss-position">ISS: Initializing...</div>
+            <div id="progress-container">Loading ISS model...</div>
+            <div id="starlink-status">Starlink: Loading...</div>
+        </div>
+
+        <!-- Import Map -->
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "./three.module.js",
+                    "three/addons/": "./jsm/"
+                }
+            }</script>
+
+        <script type="module">
+            // Imports
+            import * as THREE from 'three';
+            import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+            import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+            import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+            // Module Variables
+            let camera, scene, renderer, controls, globe, clock, moon, gui;
+            let cloudMesh, atmosphere, sun;
+            let globeMaterial; // Reference for updating uniforms
+
+            // Config Constants --- EARTH_RADIUS DEFINED HERE ---
+            const EARTH_RADIUS = 5;
+            const STAR_RADIUS = 60; // Used for starfield generation
+            const CLOUD_ALTITUDE = 0.02;
+            const ATMOSPHERE_ALTITUDE = 0.2;
+            const ISS_SCALE_FACTOR = 0.005;
+            const ISS_ORBIT_HEIGHT = 0.1 * EARTH_RADIUS; // Relative to EARTH_RADIUS
+            const MOON_RADIUS_RATIO = 0.273;
+            const MOON_ORBIT_DISTANCE_RATIO = 12.3; // More realistic visual scale than 60.3
+            const MOON_ORBITAL_PERIOD_DAYS = 27.3;
+            const MOON_ORBIT_INCLINATION_DEG = 5.1;
+            const MOON_RADIUS = EARTH_RADIUS * MOON_RADIUS_RATIO;
+            const MOON_ORBIT_RADIUS = EARTH_RADIUS * MOON_ORBIT_DISTANCE_RATIO;
+            const MOON_ORBIT_INCLINATION_RAD = MOON_ORBIT_INCLINATION_DEG * (Math.PI / 180);
+            let moonOrbitAngle = 0;
+            // --- END Config Constants ---
+
+            // --- STARLINK VARIABLES ---
+            let starlinkGroup; // Group to hold all starlink markers for easy visibility control
+            let starlinkData = []; // To store loaded starlink positions
+            let starlinkInstancedMesh;
+            const STARLINK_MARKER_SIZE = 0.015; // Size of the spheres
+            const STARLINK_ALTITUDE_OFFSET = 0.02; // Slightly above surface
+            const STARLINK_RADIUS = EARTH_RADIUS + STARLINK_ALTITUDE_OFFSET;
+            // --- NEW: Starlink Parameters Object ---
+            const starlinkParams = {
+                visible: true,
+                color: '#ff0000' // Initial red color
+            };
+            // --- END STARLINK VARIABLES ---
+
+            // Simulation Parameters Object
+            const simulationParams = {
+                simulationTimeScale: 1,
+                earthRotationSpeed: 0.05,
+                cloudRotationOffset: 0.015,
+                sunIntensity: 2.0,
+                ambientIntensity: 0.2,
+                bumpScale: 0.01,
+                nightLightBias: 0.1,
+                nightLightSmoothnessMin: 0.1,
+                nightLightSmoothnessMax: 0.4,
+                // Atmosphere parameters
+                atmosphereGlowStrength: 1.2,
+                atmosphereNoiseScale: 7.0,
+                atmosphereColor: '#4d88ff'
+            };
+            let earthRotationAngle = 0;
+
+            // ISS State Variables
+            let skylabModel;
+            let issPosition = { latitude: undefined, longitude: undefined };
+            let issTrackingEnabled = true;
+            let cameraFollowISS = true;
+            let isISSModelLoaded = false;
+            let ISS_ORBIT_HEIGHT_CURRENT = ISS_ORBIT_HEIGHT;
+            // ISS Controls Object - Passed to GUI and update function
+            const issControls = {
+                toggleTracking: () => {
+                    issTrackingEnabled = !issTrackingEnabled;
+                    fetchISSPosition(); // Fetch immediately to update status
+                    const controller = gui?.__controllers.find(c => c.property === 'toggleTracking');
+                    if (controller) controller.name(issTrackingEnabled ? 'Disable Tracking' : 'Enable Tracking');
+                    if (!issTrackingEnabled && window.clearISSTrail) window.clearISSTrail(); // Clear trail when stopping tracking
+                },
+                toggleCameraFollow: () => {
+                    cameraFollowISS = !cameraFollowISS;
+                    if (!cameraFollowISS && window.resetCameraView) window.resetCameraView(); // Reset camera if stopped following
+                    const controller = gui?.__controllers.find(c => c.property === 'toggleCameraFollow');
+                    if (controller) controller.name(cameraFollowISS ? 'Stop Following ISS' : 'Follow ISS');
+                },
+                issScale: ISS_SCALE_FACTOR,
+                cameraDistance: 0.5 // Default follow distance
+            };
+
+
+            init();
+            animate(); // Start animation loop
+
+            // --- Initialization Function ---
+            function init() {
+                console.log("init() started - Using WebGLRenderer");
+                clock = new THREE.Clock();
+
+                // Camera
+                camera = new THREE.PerspectiveCamera(25, window.innerWidth / window.innerHeight, 0.1, MOON_ORBIT_RADIUS * 4);
+                camera.position.set(EARTH_RADIUS * 3, EARTH_RADIUS * 2, EARTH_RADIUS * 6);
+
+                // Scene
+                scene = new THREE.Scene();
+                scene.background = new THREE.Color(0x000000);
+
+                // Starfield
+                addSimpleStarfield();
+
+                // Texture Loading Setup
+                console.log("Loading textures...");
+                const textureLoader = new THREE.TextureLoader();
+                let texturesLoaded = 0;
+                const totalTextures = 5; // Day, Night, Bump/CloudAlpha, CloudColor, Moon
+                const checkAllTexturesLoaded = () => {
+                    texturesLoaded++;
+                    console.log(`Texture loaded (${texturesLoaded}/${totalTextures})`);
+                    if (texturesLoaded === totalTextures) console.log("--- All Textures Loaded ---");
+                };
+                const onTextureError = (url) => (error) => {
+                    console.error(`Failed to load texture: ${url}`, error);
+                    alert(`Error loading texture: ${url}. Check path and file.`);
+                };
+
+                // Load Textures (Ensuring bumpRoughnessCloudsTexture is defined correctly)
+                const dayTexture = textureLoader.load('./textures/planets/earth_day_4096.jpg', checkAllTexturesLoaded, undefined, onTextureError('./textures/planets/earth_day_4096.jpg'));
+                dayTexture.colorSpace = THREE.SRGBColorSpace; dayTexture.anisotropy = 8;
+
+                const nightTexture = textureLoader.load('./textures/planets/earth_night_4096.jpg', checkAllTexturesLoaded, undefined, onTextureError('./textures/planets/earth_night_4096.jpg'));
+                nightTexture.colorSpace = THREE.SRGBColorSpace; nightTexture.anisotropy = 8;
+
+                // *** Correct definition of bumpRoughnessCloudsTexture ***
+                const bumpRoughnessCloudsTexture = textureLoader.load('./textures/planets/earth_bump_roughness_clouds_4096.jpg', () => {
+                    console.log("LOADED: earth_bump_roughness_clouds_4096.jpg (For Bump/Alpha)"); checkAllTexturesLoaded();
+                }, undefined, onTextureError('./textures/planets/earth_bump_roughness_clouds_4096.jpg'));
+                bumpRoughnessCloudsTexture.anisotropy = 8;
+
+                const cloudTexturePath = './textures/planets/8k_earth_clouds.jpg';
+                const cloudColorTexture = textureLoader.load(cloudTexturePath, () => {
+                    console.log(`LOADED: ${cloudTexturePath} (For Cloud Color Map)`); checkAllTexturesLoaded();
+                }, undefined, onTextureError(cloudTexturePath));
+                cloudColorTexture.colorSpace = THREE.SRGBColorSpace; cloudColorTexture.anisotropy = 4;
+
+                const moonTexture = textureLoader.load('./textures/planets/moon_1024.jpg', checkAllTexturesLoaded, undefined, onTextureError('./textures/planets/moon_1024.jpg'));
+                moonTexture.colorSpace = THREE.SRGBColorSpace; moonTexture.anisotropy = 4;
+
+                // Geometries
+                const globeGeometry = new THREE.SphereGeometry(EARTH_RADIUS, 64, 64);
+                const cloudGeometry = new THREE.SphereGeometry(EARTH_RADIUS, 64, 64); // Reusing geometry for clouds
+
+                // Lighting
+                sun = new THREE.DirectionalLight('#ffffff', simulationParams.sunIntensity);
+                sun.position.set(10, 5, 10); // Position will determine day/night
+                scene.add(sun);
+
+                const ambientLight = new THREE.AmbientLight(0xffffff, simulationParams.ambientIntensity);
+                ambientLight.name = "SceneAmbientLight"; // Give it a name for GUI updates
+                scene.add(ambientLight);
+
+                // Globe Material (with Night Lights)
+                globeMaterial = new THREE.MeshStandardMaterial({
+                    map: dayTexture,
+                    bumpMap: bumpRoughnessCloudsTexture, // Now this variable is defined
+                    bumpScale: simulationParams.bumpScale,
+                    roughness: 0.4,
+                    metalness: 0.1,
+                    name: "EarthGlobeMaterial"
+                });
+
+                // Add custom uniforms for night texture blending
+                globeMaterial.userData = {
+                    nightTexture: { value: nightTexture },
+                    sunDirection: { value: new THREE.Vector3() }, // Will be updated in animate
+                    nightLightBias: { value: simulationParams.nightLightBias },
+                    nightLightSmoothnessMin: { value: simulationParams.nightLightSmoothnessMin },
+                    nightLightSmoothnessMax: { value: simulationParams.nightLightSmoothnessMax }
+                };
+
+                globeMaterial.onBeforeCompile = shader => {
+                    // Add uniforms
+                    shader.uniforms.nightTexture = globeMaterial.userData.nightTexture;
+                    shader.uniforms.sunDirection = globeMaterial.userData.sunDirection;
+                    shader.uniforms.nightLightBias = globeMaterial.userData.nightLightBias;
+                    shader.uniforms.nightLightSmoothnessMin = globeMaterial.userData.nightLightSmoothnessMin;
+                    shader.uniforms.nightLightSmoothnessMax = globeMaterial.userData.nightLightSmoothnessMax;
+
+                    // Inject GLSL - Uniform declarations
+                    shader.fragmentShader = `
+                        uniform sampler2D nightTexture;
+                        uniform vec3 sunDirection; // Normalized direction TO the sun
+                        uniform float nightLightBias;
+                        uniform float nightLightSmoothnessMin;
+                        uniform float nightLightSmoothnessMax;
+                        ${shader.fragmentShader}
+                    `;
+
+                    // Inject GLSL - Blending Logic
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <dithering_fragment>',
+                        `
+                        // --- Custom Night Texture Blending ---
+                        vec3 worldNormal = normalize( vNormal );
+                        float dotNL = saturate( dot( worldNormal, sunDirection ) + nightLightBias );
+                        float dayStrength = smoothstep( nightLightSmoothnessMin, nightLightSmoothnessMax, dotNL );
+                        vec3 nightColor = texture2D( nightTexture, vMapUv ).rgb;
+                        gl_FragColor.rgb = mix( nightColor, gl_FragColor.rgb, dayStrength );
+                        // --- End Custom Blending ---
+
+                        #include <dithering_fragment>
+                        `
+                    );
+                };
+
+                // Globe Mesh
+                globe = new THREE.Mesh(globeGeometry, globeMaterial);
+                scene.add(globe);
+                sun.target = globe; // Set sun target AFTER globe is created
+
+                // Cloud Layer
+                const cloudMaterial = new THREE.MeshStandardMaterial({
+                    map: cloudColorTexture, transparent: true, depthWrite: false,
+                    side: THREE.DoubleSide, opacity: 0.8, name: "CloudMaterial"
+                });
+                cloudMaterial.userData.alphaTexture = { value: bumpRoughnessCloudsTexture }; // Use the same texture for alpha
+                cloudMaterial.onBeforeCompile = shader => {
+                    shader.uniforms.alphaTexture = cloudMaterial.userData.alphaTexture;
+                    shader.fragmentShader = shader.fragmentShader.replace( '#include <common>', `#include <common>\nuniform sampler2D alphaTexture;` );
+                    let uvVaryingName = 'vMapUv'; // Default UV name
+                    if (!shader.fragmentShader.includes('varying vec2 vMapUv;')) { if (shader.fragmentShader.includes('varying vec2 vUv;')) uvVaryingName = 'vUv'; else console.warn("Could not find standard UV varying in Cloud shader.");}
+                    shader.fragmentShader = shader.fragmentShader.replace( '#include <alphamap_fragment>', `#ifdef USE_ALPHAMAP\n#endif\n vec4 alphaTexColor = texture2D( alphaTexture, ${uvVaryingName} );\ndiffuseColor.a *= alphaTexColor.b;` ); // Use blue channel for alpha
+                };
+                cloudMesh = new THREE.Mesh(cloudGeometry, cloudMaterial);
+                cloudMesh.scale.setScalar(1 + CLOUD_ALTITUDE / EARTH_RADIUS);
+                scene.add(cloudMesh);
+
+                // Atmosphere Glow
+                const atmosphereGeometry = new THREE.SphereGeometry(EARTH_RADIUS, 64, 64);
+                const atmosphereMaterial = new THREE.ShaderMaterial({
+                    uniforms: { /* ... uniforms ... */
+                        earthRadius: { value: EARTH_RADIUS },
+                        atmosphereRadius: { value: EARTH_RADIUS * (1 + ATMOSPHERE_ALTITUDE / EARTH_RADIUS) },
+                        glowColor: { value: new THREE.Color(simulationParams.atmosphereColor) },
+                        time: { value: 0 },
+                        glowStrength: { value: simulationParams.atmosphereGlowStrength },
+                        noiseScale: { value: simulationParams.atmosphereNoiseScale }
+                    },
+                    vertexShader: `/* ... vertex shader ... */
+                        uniform float time; uniform float noiseScale; varying vec3 vNormal; varying vec3 vPosition;
+                        float noise(vec3 p) { vec3 i=floor(p);vec3 f=fract(p);f=f*f*(3.0-2.0*f);return mix(mix(mix(sin(dot(i,vec3(7.,157.,113.))),sin(dot(i+vec3(1,0,0),vec3(7.,157.,113.))),f.x),mix(sin(dot(i+vec3(0,1,0),vec3(7.,157.,113.))),sin(dot(i+vec3(1,1,0),vec3(7.,157.,113.))),f.x),f.y),mix(mix(sin(dot(i+vec3(0,0,1),vec3(7.,157.,113.))),sin(dot(i+vec3(1,0,1),vec3(7.,157.,113.))),f.x),mix(sin(dot(i+vec3(0,1,1),vec3(7.,157.,113.))),sin(dot(i+vec3(1,1,1),vec3(7.,157.,113.))),f.x),f.y),f.z)*.5+.5;}
+                        void main(){vNormal=normalize(normalMatrix*normal);vPosition=position;vec3 nP=position+normal*noise(position*noiseScale+time*.1)*.02;gl_Position=projectionMatrix*modelViewMatrix*vec4(nP,1.);}
+                    `,
+                    fragmentShader: `/* ... fragment shader ... */
+                        uniform vec3 glowColor; uniform float glowStrength; uniform float time; uniform float earthRadius; uniform float atmosphereRadius; varying vec3 vNormal; varying vec3 vPosition;
+                        float noise(vec3 p){vec3 i=floor(p);vec3 f=fract(p);f=f*f*(3.0-2.0*f);return mix(mix(mix(sin(dot(i,vec3(7.,157.,113.))),sin(dot(i+vec3(1,0,0),vec3(7.,157.,113.))),f.x),mix(sin(dot(i+vec3(0,1,0),vec3(7.,157.,113.))),sin(dot(i+vec3(1,1,0),vec3(7.,157.,113.))),f.x),f.y),mix(mix(sin(dot(i+vec3(0,0,1),vec3(7.,157.,113.))),sin(dot(i+vec3(1,0,1),vec3(7.,157.,113.))),f.x),mix(sin(dot(i+vec3(0,1,1),vec3(7.,157.,113.))),sin(dot(i+vec3(1,1,1),vec3(7.,157.,113.))),f.x),f.y),f.z)*.5+.5;}
+                        void main(){vec3 viewDirection=normalize(vPosition);float fresnelFactor=dot(viewDirection,vNormal);fresnelFactor=clamp(1.-fresnelFactor,0.,1.);fresnelFactor=pow(fresnelFactor,2.)*glowStrength;vec3 noiseCoords=vPosition*5.+time*.05;float noiseValue=noise(noiseCoords);float radialFalloff=length(vPosition)/atmosphereRadius;float innerGlow=1.-smoothstep(earthRadius/atmosphereRadius,1.,radialFalloff);innerGlow=pow(innerGlow,1.5);float finalOpacity=mix(innerGlow*.3,fresnelFactor,.7);finalOpacity*=(.9+noiseValue*.2);gl_FragColor=vec4(glowColor,finalOpacity);}
+                    `,
+                    side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+                });
+                atmosphere = new THREE.Mesh(atmosphereGeometry, atmosphereMaterial);
+                atmosphere.scale.setScalar(1 + ATMOSPHERE_ALTITUDE / EARTH_RADIUS);
+                scene.add(atmosphere);
+
+                // Moon
+                const moonGeometry = new THREE.SphereGeometry(MOON_RADIUS, 32, 32);
+                const moonMaterial = new THREE.MeshStandardMaterial({ map: moonTexture, roughness: 0.9, name: "MoonMaterial" });
+                moon = new THREE.Mesh(moonGeometry, moonMaterial);
+                scene.add(moon); // Moon position updated in animate()
+
+                // --- GUI Setup ---
+                gui = new GUI();
+                const simulationFolder = gui.addFolder('Simulation');
+                simulationFolder.add(simulationParams, 'simulationTimeScale', 0.1, 8640, 0.1).name('Sim Speed (days/sec)');
+                simulationFolder.add(simulationParams, 'earthRotationSpeed', 0, 0.2, 0.001).name('Earth Rot Speed');
+                simulationFolder.add(simulationParams, 'cloudRotationOffset', -0.05, 0.05, 0.001).name('Cloud Speed Offset');
+                simulationFolder.add(simulationParams, 'sunIntensity', 0, 5, 0.1).name('Sun Intensity').onChange(value => { if (sun) sun.intensity = value; });
+                simulationFolder.add(simulationParams, 'ambientIntensity', 0, 1, 0.05).name('Ambient Intensity').onChange(value => { const ambLight = scene.getObjectByName("SceneAmbientLight"); if (ambLight) ambLight.intensity = value; });
+                simulationFolder.open();
+
+                const globeMaterialFolder = gui.addFolder('Globe Material');
+                globeMaterialFolder.add(globeMaterial, 'roughness', 0, 1, 0.01).name('Roughness');
+                globeMaterialFolder.add(globeMaterial, 'metalness', 0, 1, 0.01).name('Metalness');
+                globeMaterialFolder.add(simulationParams, 'bumpScale', 0, 0.1, 0.001).name('Bump Scale').onChange(value => { if (globeMaterial) globeMaterial.bumpScale = value; });
+                globeMaterialFolder.add(simulationParams, 'nightLightBias', 0, 0.5, 0.01).name('Night Bias').onChange(value => { if (globeMaterial?.userData.nightLightBias) globeMaterial.userData.nightLightBias.value = value; });
+                globeMaterialFolder.add(simulationParams, 'nightLightSmoothnessMin', 0, 0.5, 0.01).name('Night Smooth Min').onChange(value => { if (globeMaterial?.userData.nightLightSmoothnessMin) globeMaterial.userData.nightLightSmoothnessMin.value = value; });
+                globeMaterialFolder.add(simulationParams, 'nightLightSmoothnessMax', 0.1, 1.0, 0.01).name('Night Smooth Max').onChange(value => { if (globeMaterial?.userData.nightLightSmoothnessMax) globeMaterial.userData.nightLightSmoothnessMax.value = value; });
+
+                const atmosphereFolder = gui.addFolder('Atmosphere');
+                atmosphereFolder.add(simulationParams, 'atmosphereGlowStrength', 0.1, 3.0, 0.1).name('Glow Strength').onChange(value => { if (atmosphere?.material.uniforms) atmosphere.material.uniforms.glowStrength.value = value; });
+                atmosphereFolder.add(simulationParams, 'atmosphereNoiseScale', 1.0, 20.0, 0.5).name('Noise Scale').onChange(value => { if (atmosphere?.material.uniforms) atmosphere.material.uniforms.noiseScale.value = value; });
+                atmosphereFolder.addColor(simulationParams, 'atmosphereColor').name('Glow Color').onChange(value => { if (atmosphere?.material.uniforms) atmosphere.material.uniforms.glowColor.value.set(value); });
+
+                // --- Starlink GUI Folder ---
+                const starlinkFolder = gui.addFolder('Starlink');
+                starlinkFolder.add(starlinkParams, 'visible').name('Show Starlink').onChange(value => {
+                    if (starlinkGroup) {
+                        starlinkGroup.visible = value; // Toggle visibility of the entire group
+                    }
+                });
+                starlinkFolder.addColor(starlinkParams, 'color').name('Starlink Color').onChange(value => {
+                    if (starlinkInstancedMesh && starlinkInstancedMesh.material) {
+                        if (starlinkInstancedMesh.material.color) {
+                            starlinkInstancedMesh.material.color.set(value);
+                        } else {
+                            console.warn("Starlink material doesn't have a color property.");
+                        }
+                    }
+                });
+                starlinkFolder.open(); // Keep the folder open by default
+                // --- END Starlink GUI ---
+
+                // Renderer
+                console.log("Creating WebGLRenderer...");
+                try {
+                    renderer = new THREE.WebGLRenderer({ antialias: true });
+                    renderer.setPixelRatio(window.devicePixelRatio);
+                    renderer.setSize(window.innerWidth, window.innerHeight);
+                    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+                    renderer.toneMappingExposure = 0.8;
+                    document.body.appendChild(renderer.domElement);
+                    console.log("WebGLRenderer created and added to DOM.");
+                } catch (e) { console.error("Error creating WebGLRenderer:", e); alert("Error creating WebGLRenderer. Check console."); return; }
+
+                // Controls
+                controls = new OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true; controls.dampingFactor = 0.05;
+                controls.minDistance = EARTH_RADIUS * 1.1; controls.maxDistance = MOON_ORBIT_RADIUS * 3;
+                controls.target.set(0, 0, 0); // Initialize target
+
+                // Resize Listener
+                window.addEventListener('resize', onWindowResize);
+
+                // ISS Setup (Must be called AFTER GUI is initialized, PASS the issControls object)
+                if (gui) { setupISS(gui, issControls); }
+                else { console.error("GUI not initialized before calling setupISS"); }
+
+                // --- STARLINK SETUP ---
+                fetchStarlinkData(); // Fetch and process Starlink data initially
+                const starlinkUpdateInterval = 60000; // 60 seconds in milliseconds
+                setInterval(fetchStarlinkData, starlinkUpdateInterval);
+                console.log(`Starlink data will be updated every ${starlinkUpdateInterval / 1000} seconds.`);
+                // --- END STARLINK SETUP ---
+
+                console.log("init() finished.");
+            } // --- End init() ---
+
+
+           // --- Starfield Function ---
+            function addSimpleStarfield() {
+              const starCount = 100000; // Increased star count
+              const minRadius = MOON_ORBIT_RADIUS * 1.5; // Start further out
+              const maxRadius = MOON_ORBIT_RADIUS * 5; // Extend further
+
+              const starGeometry = new THREE.SphereGeometry(0.03, 4, 4); // Reduced size and segments
+              const starMaterial = new THREE.MeshBasicMaterial({
+                transparent: true,
+                opacity: 0.9,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+              });
+
+              const instancedStars = new THREE.InstancedMesh(starGeometry, starMaterial, starCount);
+              const dummy = new THREE.Object3D();
+              const color = new THREE.Color();
+
+              for (let i = 0; i < starCount; i++) {
+                const radius = minRadius + Math.random() * (maxRadius - minRadius);
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+
+                const x = radius * Math.sin(phi) * Math.cos(theta);
+                const y = radius * Math.sin(phi) * Math.sin(theta);
+                const z = radius * Math.cos(phi);
+                dummy.position.set(x, y, z);
+
+                const sizeFactor = 0.5 + Math.random() * 1.0;
+                dummy.scale.set(sizeFactor, sizeFactor, sizeFactor);
+
+                dummy.updateMatrix();
+                instancedStars.setMatrixAt(i, dummy.matrix);
+
+                const brightness = 0.8 + Math.random() * 0.2;
+                const hue = 0.6 + (Math.random() - 0.5) * 0.1;
+                const saturation = Math.random() * 0.15;
+
+                color.setHSL(hue, saturation, brightness);
+                instancedStars.setColorAt(i, color);
+              }
+
+              instancedStars.instanceMatrix.needsUpdate = true;
+              if (instancedStars.instanceColor) {
+                instancedStars.instanceColor.needsUpdate = true;
+              }
+
+              scene.add(instancedStars);
+              console.log("Instanced starfield added.");
+            }
+
+            // --- Resize Handler ---
+            function onWindowResize() {
+                 if (!camera || !renderer) return;
+                 camera.aspect = window.innerWidth / window.innerHeight;
+                 camera.updateProjectionMatrix();
+                 renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+
+            // --- Animation Loop ---
+            function animate() {
+                try {
+                    requestAnimationFrame(animate);
+                    if (!clock || !renderer || !scene || !camera) return; // Core component check
+
+                    const delta = clock.getDelta();
+                    const elapsedTime = clock.getElapsedTime();
+
+                    // Update atmosphere time
+                    if (atmosphere?.material.uniforms) {
+                        atmosphere.material.uniforms.time.value += delta * 0.1;
+                    }
+
+                    // Update sun direction for night lighting
+                    if (sun && globeMaterial?.userData.sunDirection) {
+                        const sunWorldPos = new THREE.Vector3();
+                        sun.getWorldPosition(sunWorldPos);
+                        globeMaterial.userData.sunDirection.value.copy(sunWorldPos).normalize();
+                    }
+
+                    // Earth and Cloud Rotation
+                    const baseSpeed = simulationParams.earthRotationSpeed;
+                    const offsetSpeed = simulationParams.cloudRotationOffset;
+                    const globeSpeedRad = delta * (isNaN(baseSpeed) ? 0 : baseSpeed);
+                    const cloudSpeedRad = delta * ((isNaN(baseSpeed) ? 0 : baseSpeed) + (isNaN(offsetSpeed) ? 0 : offsetSpeed));
+
+                    if (globe) {
+                        globe.rotation.y += globeSpeedRad;
+                        earthRotationAngle = globe.rotation.y; // Store current angle
+                    }
+                    if (cloudMesh) cloudMesh.rotation.y += cloudSpeedRad;
+                    if (atmosphere && globe) atmosphere.rotation.y = globe.rotation.y; // Sync atmosphere
+
+                    // Rotate Starlink group with the Earth
+                    if (starlinkGroup) {
+                        starlinkGroup.rotation.y = earthRotationAngle;
+                    }
+
+                    // Moon Orbit Calculation
+                    if (moon && globe) {
+                        const simulatedDays = elapsedTime * simulationParams.simulationTimeScale;
+                        const orbitsCompleted = simulatedDays / MOON_ORBITAL_PERIOD_DAYS;
+                        moonOrbitAngle = (orbitsCompleted * 2 * Math.PI) % (2*Math.PI);
+
+                        const moonX_flat = MOON_ORBIT_RADIUS * Math.cos(moonOrbitAngle);
+                        const moonZ_flat = MOON_ORBIT_RADIUS * Math.sin(moonOrbitAngle);
+                        const moonPosition = new THREE.Vector3(moonX_flat, 0, moonZ_flat);
+                        moonPosition.applyAxisAngle(new THREE.Vector3(1, 0, 0), MOON_ORBIT_INCLINATION_RAD);
+
+                        moon.position.copy(moonPosition);
+                        moon.lookAt(globe.position);
+                        moon.rotation.y += Math.PI;
+                    }
+
+                    // Update ISS Position and Camera Follow (pass the controls object)
+                    if (isISSModelLoaded) {
+                        // *** Pass the global issControls object ***
+                        updateISSModelPosition(issControls);
+                    }
+
+                    // Update UI Text
+                    const displayElement = document.getElementById('iss-position');
+                    if (displayElement) {
+                        if (issTrackingEnabled && issPosition.latitude !== undefined) {
+                            displayElement.innerHTML = `ISS: Lat ${issPosition.latitude.toFixed(2)}°, Lon ${issPosition.longitude.toFixed(2)}°`;
+                        } else if (!issTrackingEnabled) {
+                            displayElement.innerHTML = 'ISS: Tracking Disabled';
+                        } else if (isISSModelLoaded) {
+                            displayElement.innerHTML = 'ISS: Fetching...';
+                        } else {
+                            displayElement.innerHTML = 'ISS: Model Loading...';
+                        }
+                    }
+
+                    // Update OrbitControls
+                    if (controls) controls.update();
+
+                    // Render the scene
+                    renderer.render(scene, camera);
+
+                } catch (error) {
+                    console.error("Error in animate loop:", error); // Log error but continue if possible
+                    // Stop the loop if the error is critical?
+                    // cancelAnimationFrame(animate); // Uncomment to stop on error
+                }
+            } // --- End animate() ---
+
+
+            // --- Lat/Lon to Vector3 ---
+            function latLongToVector3(lat, lon, radius) {
+                 const latRad = lat * (Math.PI / 180);
+                 const lonRad = (lon * (Math.PI / 180));
+                 const x = radius * Math.cos(latRad) * Math.cos(lonRad);
+                 const y = radius * Math.sin(latRad);
+                 const z = radius * Math.cos(latRad) * Math.sin(lonRad);
+                 return new THREE.Vector3(x, y, z);
+            }
+
+
+            // --- STARLINK FUNCTIONS ---
+            async function fetchStarlinkData() {
+                const url = './output/starlink_locations.json';
+                const statusElement = document.getElementById('starlink-status');
+                try {
+                    // console.log("Fetching Starlink data from:", url); // Reduce console noise
+                    const response = await fetch(url);
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    const data = await response.json();
+                    // console.log(`Successfully fetched ${data.length} Starlink locations.`);
+                    if (statusElement) statusElement.innerHTML = `Starlink: Loaded ${data.length} satellites.`;
+                    starlinkData = data;
+                    setupStarlinkMarkers(starlinkData); // Setup markers with the new data
+                } catch (error) {
+                    console.error("Error fetching or parsing Starlink data:", error);
+                    if (statusElement) statusElement.innerHTML = 'Starlink: Error loading data.';
+                    starlinkData = [];
+                    setupStarlinkMarkers(starlinkData); // Clear existing markers on error
+                }
+            }
+
+            function setupStarlinkMarkers(data) {
+                if (!scene) { console.error("Scene not ready for Starlink markers."); return; }
+
+                // Remove previous group FIRST
+                if (starlinkGroup) {
+                    scene.remove(starlinkGroup);
+                    if (starlinkInstancedMesh) {
+                        if (starlinkInstancedMesh.geometry) starlinkInstancedMesh.geometry.dispose();
+                        if (starlinkInstancedMesh.material) starlinkInstancedMesh.material.dispose();
+                        // console.log("Disposed previous Starlink geometry and material."); // Reduce noise
+                    }
+                    starlinkInstancedMesh = null;
+                    starlinkGroup = null;
+                    // console.log("Previous Starlink group removed."); // Reduce noise
+                }
+
+                if (!data || !Array.isArray(data) || data.length === 0) {
+                    console.warn("No Starlink data to display or data invalid.");
+                    // Optionally disable GUI controls
+                    return;
+                }
+
+                // Create the Group and Set its Visibility
+                starlinkGroup = new THREE.Group();
+                starlinkGroup.name = "StarlinkGroup";
+                starlinkGroup.visible = starlinkParams.visible;
+
+                const count = data.length;
+                const geometry = new THREE.SphereGeometry(STARLINK_MARKER_SIZE, 8, 8); // Shared geometry
+                const material = new THREE.MeshBasicMaterial({ // Shared material
+                    color: starlinkParams.color,
+                    depthTest: true,
+                    transparent: true,
+                    opacity: 0.85
+                });
+
+                starlinkInstancedMesh = new THREE.InstancedMesh(geometry, material, count);
+                starlinkInstancedMesh.renderOrder = 2;
+
+                const matrix = new THREE.Matrix4();
+                const position = new THREE.Vector3();
+                const quaternion = new THREE.Quaternion();
+                const scale = new THREE.Vector3(1, 1, 1);
+                let validCount = 0;
+
+                for (let i = 0; i < count; i++) {
+                    const sat = data[i];
+                    if (sat && typeof sat.lat === 'number' && typeof sat.lon === 'number') {
+                        position.copy(latLongToVector3(sat.lat, sat.lon, STARLINK_RADIUS));
+                        if (isNaN(position.x) || !isFinite(position.x) || isNaN(position.y) || !isFinite(position.y) || isNaN(position.z) || !isFinite(position.z)) {
+                            console.warn("Skipping Starlink entry due to invalid calculated position:", sat, position);
+                            continue;
+                        }
+                        matrix.compose(position, quaternion, scale);
+                        starlinkInstancedMesh.setMatrixAt(validCount, matrix);
+                        validCount++;
+                    } else {
+                        // console.warn("Skipping Starlink entry with missing/invalid lat/lon:", sat); // Reduce noise
+                    }
+                }
+
+                starlinkInstancedMesh.count = validCount; // Set actual number of instances
+                starlinkInstancedMesh.instanceMatrix.needsUpdate = true;
+                starlinkGroup.add(starlinkInstancedMesh);
+                scene.add(starlinkGroup);
+                console.log(`Starlink InstancedMesh created/updated with ${validCount} markers.`);
+            }
+            // --- END STARLINK FUNCTIONS ---
+
+
+            // --- ISS Setup Function --- (Includes Fix for controls.target.lerp)
+            function setupISS(gui, issControlsOptions) { // Use the options object passed in
+                const issFolder = gui.addFolder('ISS Controls');
+                issFolder.add(issControlsOptions, 'toggleTracking').name(issTrackingEnabled ? 'Disable Tracking' : 'Enable Tracking');
+                issFolder.add(issControlsOptions, 'toggleCameraFollow').name(cameraFollowISS ? 'Stop Following ISS' : 'Follow ISS');
+                issFolder.add(issControlsOptions, 'issScale', 0.001, 0.25, .0005).name('ISS Scale').onChange((v) => { if (skylabModel) skylabModel.scale.set(v, v, v); });
+                issFolder.add(issControlsOptions, 'cameraDistance', .1, 5, .05).name('Follow Distance');
+                issFolder.open();
+
+                // Simple marker
+                const issMarker = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.03, 16, 16),
+                    new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false })
+                );
+                issMarker.visible = false;
+                issMarker.renderOrder = 1;
+                scene.add(issMarker);
+
+                // Trail setup
+                let issTrailPoints = [];
+                const MAX_TRAIL_POINTS = 300;
+                let issTrail;
+                function createISSTrail() {
+                    const geometry = new THREE.BufferGeometry();
+                    const material = new THREE.LineBasicMaterial({ color: 0x00ffff, opacity: 0.6, transparent: true, depthTest: false });
+                    issTrail = new THREE.Line(geometry, material);
+                    issTrail.renderOrder = 0;
+                    issTrail.visible = false;
+                    scene.add(issTrail);
+                }
+                createISSTrail();
+
+                function updateISSTrail(currentPosition) {
+                    if (!issTrackingEnabled || !issTrail || !currentPosition) return;
+                    const MIN_DIST_SQ = 0.0001;
+                    if (issTrailPoints.length === 0 || currentPosition.distanceToSquared(issTrailPoints[issTrailPoints.length - 1]) > MIN_DIST_SQ) {
+                        if (issTrailPoints.length >= MAX_TRAIL_POINTS) issTrailPoints.shift();
+                        issTrailPoints.push(currentPosition.clone());
+                        const positions = new Float32Array(issTrailPoints.length * 3);
+                        for (let i = 0; i < issTrailPoints.length; i++) issTrailPoints[i].toArray(positions, i * 3);
+                        issTrail.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        issTrail.geometry.attributes.position.needsUpdate = true;
+                        issTrail.geometry.computeBoundingSphere();
+                        issTrail.visible = issTrailPoints.length > 1;
+                    }
+                }
+
+                window.clearISSTrail = function() {
+                    issTrailPoints.length = 0;
+                    if (issTrail?.geometry) {
+                        issTrail.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+                        issTrail.geometry.attributes.position.needsUpdate = true;
+                        issTrail.visible = false;
+                    }
+                    console.log("ISS trail cleared.");
+                };
+
+                // Load the GLTF Model
+                console.log("Setting up GLTFLoader for ISS model...");
+                const loader = new GLTFLoader().setPath('./public/station/');
+                loader.load('scene.gltf',
+                    (gltf) => { // Success
+                        console.log("ISS GLTF loaded successfully.");
+                        skylabModel = gltf.scene;
+                        skylabModel.scale.set(issControlsOptions.issScale, issControlsOptions.issScale, issControlsOptions.issScale); // Use scale from options
+                        skylabModel.visible = false;
+                        scene.add(skylabModel);
+                        isISSModelLoaded = true;
+                        console.log("ISS model added to scene, isISSModelLoaded = true");
+                        const progressElement = document.getElementById('progress-container');
+                        if (progressElement) progressElement.style.display = 'none';
+                        fetchISSPosition(); // Fetch position now
+                    },
+                    (xhr) => { /* Progress */
+                        const percentLoaded = Math.floor(xhr.loaded / xhr.total * 100);
+                        const progressElement = document.getElementById('progress-container');
+                        if (progressElement) progressElement.innerHTML = `Loading ISS: ${percentLoaded}%`;
+                    },
+                    (error) => { /* Error */
+                        console.error("Error loading ISS GLTF model:", error);
+                        const progressElement = document.getElementById('progress-container');
+                        if (progressElement) progressElement.innerHTML = "Error loading ISS model.";
+                        isISSModelLoaded = false;
+                    }
+                );
+
+                // --- API Fetching Logic ---
+                window.fetchISSPosition = async function() {
+                    if ((!issTrackingEnabled && !skylabModel?.visible && !issMarker.visible) || !isISSModelLoaded) {
+                        return;
+                    }
+                    let fetchedData = null;
+                    const primaryUrl = 'https://api.wheretheiss.at/v1/satellites/25544';
+                    const fallbackUrl = 'https://api.open-notify.org/iss-now.json';
+                    try {
+                        let response = await fetch(primaryUrl);
+                        if (!response.ok) {
+                            console.warn(`Primary ISS API failed (${response.status}), trying fallback...`);
+                            response = await fetch(fallbackUrl);
+                            if (!response.ok) throw new Error(`Fallback ISS API failed (${response.status})`);
+                            const data = await response.json();
+                            if (data.message === "success" && data.iss_position) {
+                                fetchedData = { latitude: data.iss_position.latitude, longitude: data.iss_position.longitude };
+                                console.log("Fetched ISS position from Fallback API.");
+                            } else throw new Error('Fallback API response format invalid.');
+                        } else {
+                            const data = await response.json();
+                            if (data.latitude !== undefined && data.longitude !== undefined) {
+                                fetchedData = { latitude: data.latitude, longitude: data.longitude };
+                            } else throw new Error('Primary API response missing lat/lon.');
+                        }
+                        if (fetchedData) {
+                            issPosition.latitude = parseFloat(fetchedData.latitude);
+                            issPosition.longitude = parseFloat(fetchedData.longitude);
+                             if (isNaN(issPosition.latitude) || isNaN(issPosition.longitude)) {
+                                 throw new Error("Parsed latitude or longitude is NaN.");
+                             }
+                        } else {
+                             issPosition = { latitude: undefined, longitude: undefined };
+                        }
+                    } catch (error) {
+                        console.error("Error fetching ISS position:", error);
+                        issPosition = { latitude: undefined, longitude: undefined };
+                        if (skylabModel) skylabModel.visible = false;
+                        issMarker.visible = false;
+                        if (window.clearISSTrail) window.clearISSTrail();
+                        const displayElement = document.getElementById('iss-position');
+                        if (displayElement) displayElement.innerHTML = 'ISS: Error fetching data';
+                    }
+                }; // --- End fetchISSPosition ---
+
+
+                // --- Update Model/Marker Position (Includes lerp fix) ---
+                window.updateISSModelPosition = function(followOptions) { // Parameter renamed
+                    if (!globe || !issTrackingEnabled || (issPosition.latitude === undefined || issPosition.longitude === undefined)) {
+                         if (skylabModel) skylabModel.visible = false;
+                         issMarker.visible = false;
+                         return;
+                    }
+                    const basePosition = latLongToVector3(issPosition.latitude, issPosition.longitude, EARTH_RADIUS + ISS_ORBIT_HEIGHT_CURRENT);
+                    const rotationMatrix = new THREE.Matrix4().makeRotationY(earthRotationAngle);
+                    const rotatedPosition = basePosition.clone().applyMatrix4(rotationMatrix);
+
+                    issMarker.position.copy(rotatedPosition);
+
+                    if (skylabModel && isISSModelLoaded) {
+                        skylabModel.position.copy(rotatedPosition);
+                        skylabModel.lookAt(globe.position);
+                        skylabModel.visible = true;
+                        issMarker.visible = false;
+                    } else if (skylabModel) {
+                        skylabModel.visible = false;
+                    } else {
+                        issMarker.visible = true;
+                    }
+
+                    // Update camera if following
+                    // Use global 'controls' (OrbitControls) and 'camera'
+                    if (cameraFollowISS && camera && controls) {
+                        const targetPosition = rotatedPosition.clone();
+                        const directionFromEarth = targetPosition.clone().normalize();
+
+                        // Use renamed parameter 'followOptions' for distance
+                        const cameraDistance = followOptions.cameraDistance || 0.5;
+                        const cameraOffset = directionFromEarth.multiplyScalar(cameraDistance);
+                        let desiredCameraPosition = targetPosition.clone().add(cameraOffset);
+
+                        const upVector = new THREE.Vector3(0, 1, 0);
+                        const cameraUpOffset = upVector.multiplyScalar(cameraDistance * 0.2);
+                        desiredCameraPosition.add(cameraUpOffset);
+
+                        const lerpFactor = 0.05;
+                        camera.position.lerp(desiredCameraPosition, lerpFactor);
+
+                        // *** FIX APPLIED HERE ***
+                        // Check if controls.target exists and has lerp before calling
+                        if (controls.target && typeof controls.target.lerp === 'function') {
+                             controls.target.lerp(targetPosition, lerpFactor);
+                        } else {
+                            console.warn("OrbitControls target is missing or invalid during camera follow update.");
+                            // Optionally try to recover by setting target directly, though risky
+                            // controls.target = targetPosition.clone();
+                            // controls.update(); // Update controls if target is manually set
+                        }
+                        // *** END FIX ***
+                    }
+
+                    updateISSTrail(rotatedPosition);
+
+                }; // --- End updateISSModelPosition ---
+
+
+                // --- Reset Camera View Function (Global) ---
+                window.resetCameraView = function() {
+                    if (!camera || !controls || !globe || !clock) return;
+                    console.log("Resetting camera view...");
+                    cameraFollowISS = false;
+                    const controller = gui?.__controllers.find(c => c.property === 'toggleCameraFollow');
+                    if (controller) controller.name('Follow ISS');
+
+                    const targetCameraPosition = new THREE.Vector3(EARTH_RADIUS * 3, EARTH_RADIUS * 2, EARTH_RADIUS * 6);
+                    const targetControlsTarget = globe.position.clone();
+                    const duration = 1.0;
+                    const startTime = clock.elapsedTime;
+                    const startCameraPosition = camera.position.clone();
+                    const startControlsTarget = controls.target.clone();
+
+                    function animateReset() {
+                        if (cameraFollowISS) return;
+                        const elapsed = clock.elapsedTime - startTime;
+                        const progress = Math.min(elapsed / duration, 1.0);
+                        const easedProgress = progress * (2 - progress); // Ease-out quadratic
+                        camera.position.lerpVectors(startCameraPosition, targetCameraPosition, easedProgress);
+                        controls.target.lerpVectors(startControlsTarget, targetControlsTarget, easedProgress);
+                        controls.update();
+                        if (progress < 1.0) {
+                            requestAnimationFrame(animateReset);
+                        } else {
+                            camera.position.copy(targetCameraPosition);
+                            controls.target.copy(targetControlsTarget);
+                            controls.update();
+                            console.log("Camera reset complete.");
+                        }
+                    }
+                    requestAnimationFrame(animateReset);
+                }; // --- End resetCameraView ---
+
+                // Initial fetch and set interval
+                console.log("Setting up ISS fetch interval (10 seconds)...");
+                fetchISSPosition();
+                setInterval(fetchISSPosition, 10000);
+
+                console.log("setupISS complete.");
+            } // --- End setupISS() ---
+
+        </script>
+    </body>
+</html>
