@@ -1,5 +1,8 @@
 # ISS & Starlink Tracker
 
+![Screenshot of the GUI](./gui.png)
+
+
 A web-based 3D visualization of the International Space Station (ISS) and Starlink satellite constellation orbiting the Earth.
 
 ## Description
